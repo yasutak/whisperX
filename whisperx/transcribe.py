@@ -1,26 +1,25 @@
 import argparse
 import os
 import warnings
-from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Iterator, TYPE_CHECKING
 
 import numpy as np
 import torch
 import torchaudio
-import tqdm
 from transformers import AutoProcessor, Wav2Vec2ForCTC
-
-from .alignment import backtrack, get_trellis, merge_repeats, merge_words
-from .audio import (HOP_LENGTH, N_FRAMES, SAMPLE_RATE, load_audio,
-                    log_mel_spectrogram, pad_or_trim)
+import tqdm
+from .audio import SAMPLE_RATE, N_FRAMES, HOP_LENGTH, pad_or_trim, log_mel_spectrogram, load_audio
+from .alignment import get_trellis, backtrack, merge_repeats, merge_words
 from .decoding import DecodingOptions, DecodingResult
 from .tokenizer import LANGUAGES, TO_LANGUAGE_CODE, get_tokenizer
-from .utils import (exact_div, format_timestamp, optional_float, optional_int,
-                    str2bool, write_ass, write_srt, write_txt, write_vtt)
+from .utils import exact_div, format_timestamp, optional_int, optional_float, str2bool, write_txt, write_vtt, write_srt, write_ass
 
 if TYPE_CHECKING:
     from .model import Whisper
 
-wa2vec2_models_on_hugginface = ["jonatasgrosman/wav2vec2-large-xlsr-53-japanese"]
+hugginface_models = ["jonatasgrosman/wav2vec2-large-xlsr-53-japanese"]
+asian_languages = ["ja"]
+
 
 def transcribe(
     model: "Whisper",
@@ -31,7 +30,7 @@ def transcribe(
     compression_ratio_threshold: Optional[float] = 2.4,
     logprob_threshold: Optional[float] = -1.0,
     no_speech_threshold: Optional[float] = 0.6,
-    condition_on_previous_text: bool = True,
+    condition_on_previous_text: bool = False, # turn off by default due to errors it causes
     **decode_options,
 ):
     """
@@ -261,6 +260,7 @@ def align(
     device: str,
     extend_duration: float = 0.0,
     start_from_previous: bool = True,
+    drop_non_aligned_words: bool = False,
 ):
     print("Performing alignment...")
     if not torch.is_tensor(audio):
@@ -273,6 +273,7 @@ def align(
     MAX_DURATION = audio.shape[1] / SAMPLE_RATE
 
     prev_t2 = 0
+    word_segments_list = []
     for idx, segment in enumerate(transcript):
         t1 = max(segment['start'] - extend_duration, 0)
         t2 = min(segment['end'] + extend_duration, MAX_DURATION)
@@ -284,14 +285,17 @@ def align(
 
         waveform_segment = audio[:, f1:f2]
         with torch.inference_mode():
-            emissions = model(waveform_segment.to(device)).logits
+            if language not in asian_languages:
+                emissions, _ = model(waveform_segment.to(device))
+            else:
+                emissions = model(waveform_segment.to(device)).logits
             emissions = torch.log_softmax(emissions, dim=-1)
         emission = emissions[0].cpu().detach()
         transcription = segment['text'].strip()
-        if language != "ja":
+        if language not in asian_languages:
             t_words = transcription.split(' ')
         else:
-            t_words = [c for c in transcription] #FIXME: ideally, we should use a tokenizer for Japanese to extract words
+            t_words = [c for c in transcription]
 
         t_words_clean = [''.join([w for w in word if w.lower() in model_dictionary.keys()]) for word in t_words]
         t_words_nonempty = [x for x in t_words_clean if x != ""]
@@ -322,8 +326,7 @@ def align(
             segment['end'] = t2_actual
             prev_t2 = segment['end']
 
-
-            # merge missing words to previous, or merge with next word ahead if idx == 0
+            # for the .ass output
             for x in range(len(t_local)):
                 curr_word = t_words[x]
                 curr_timestamp = t_local[x]
@@ -332,15 +335,29 @@ def align(
                 else:
                     segment['word-level'].append({"text": curr_word, "start": None, "end": None})
 
+            # for per-word .srt ouput
+            # merge missing words to previous, or merge with next word ahead if idx == 0
+            for x in range(len(t_local)):
+                curr_word = t_words[x]
+                curr_timestamp = t_local[x]
+                if curr_timestamp is not None:
+                    word_segments_list.append({"text": curr_word, "start": curr_timestamp[0], "end": curr_timestamp[1]})
+                elif not drop_non_aligned_words:
+                    # then we merge
+                    if x == 0:
+                        t_words[x+1] = " ".join([curr_word, t_words[x+1]])
+                    else:
+                        word_segments_list[-1]['text'] += ' ' + curr_word
         else:
             # then we resort back to original whisper timestamps
             # segment['start] and segment['end'] are unchanged
             prev_t2 = 0
             segment['word-level'].append({"text": segment['text'], "start": segment['start'], "end":segment['end']})
+            word_segments_list.append({"text": segment['text'], "start": segment['start'], "end":segment['end']})
 
         print(f"[{format_timestamp(segment['start'])} --> {format_timestamp(segment['end'])}] {segment['text']}")
 
-    return {"segments": transcript}
+    return {"segments": transcript, "word_segments": word_segments_list}
 
 def cli():
     from . import available_models
@@ -351,9 +368,10 @@ def cli():
     parser.add_argument("--model_dir", type=str, default=None, help="the path to save model files; uses ~/.cache/whisper by default")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="device to use for PyTorch inference")
     # alignment params
-    parser.add_argument("--align_model", default="WAV2VEC2_ASR_LARGE_LV60K_960H", help="Name of phoneme-level ASR model to do alignment")
+    parser.add_argument("--align_model", default="WAV2VEC2_ASR_BASE_960H", help="Name of phoneme-level ASR model to do alignment")
     parser.add_argument("--align_extend", default=2, type=float, help="Seconds before and after to extend the whisper segments for alignment")
     parser.add_argument("--align_from_prev", default=True, type=bool, help="Whether to clip the alignment start time of current segment to the end time of the last aligned word of the previous segment")
+    parser.add_argument("--drop_non_aligned", action="store_true", help="For word .srt, whether to drop non aliged words, or merge them into neighbouring.")
 
     parser.add_argument("--output_dir", "-o", type=str, default=".", help="directory to save the outputs")
     parser.add_argument("--output_type", default="srt", choices=['all', 'srt', 'vtt', 'txt'], help="directory to save the outputs")
@@ -390,7 +408,7 @@ def cli():
     align_model: str = args.pop("align_model")
     align_extend: float = args.pop("align_extend")
     align_from_prev: bool = args.pop("align_from_prev")
-    # align_interpolate_missing: bool = args.pop("align_interpolate_missing")
+    drop_non_aligned: bool = args.pop("drop_non_aligned")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -417,19 +435,20 @@ def cli():
         align_model = bundle.get_model().to(device)
         labels = bundle.get_labels()
         align_dictionary = {c.lower(): i for i, c in enumerate(labels)}
-    elif align_model in wa2vec2_models_on_hugginface:
+    elif align_model in hugginface_models:
         processor = AutoProcessor.from_pretrained(align_model)
         align_model = Wav2Vec2ForCTC.from_pretrained(align_model).to(device)
         align_model.to(device)
         labels = processor.tokenizer.get_vocab()
         align_dictionary = processor.tokenizer.get_vocab()
     else:
-        print(f'Align model "{align_model}" is not supported, choose from:\n {torchaudio.pipelines.__all__ + wa2vec2_models_on_hugginface}')
+        print(f'Align model "{align_model}" is not supported, choose from:\n {torchaudio.pipelines.__all__ + wa2vec2_models_on_hugginface} \n\
+            See details here https://pytorch.org/audio/stable/pipelines.html#id14')
         raise ValueError(f'Align model "{align_model}" not supported')
     for audio_path in args.pop("audio"):
         result = transcribe(model, audio_path, temperature=temperature, **args)
         result_aligned = align(result["segments"], result["language"], align_model, align_dictionary, audio_path, device,
-                                extend_duration=align_extend, start_from_previous=align_from_prev)
+                                extend_duration=align_extend, start_from_previous=align_from_prev, drop_non_aligned_words=drop_non_aligned)
         audio_basename = os.path.basename(audio_path)
 
         # save TXT
@@ -446,6 +465,10 @@ def cli():
         if output_type in ["srt", "all"]:
             with open(os.path.join(output_dir, audio_basename + ".srt"), "w", encoding="utf-8") as srt:
                 write_srt(result_aligned["segments"], file=srt)
+
+        # save per-word SRT
+        with open(os.path.join(output_dir, audio_basename + ".word.srt"), "w", encoding="utf-8") as srt:
+            write_srt(result_aligned["word_segments"], file=srt)
 
         # save ASS
         with open(os.path.join(output_dir, audio_basename + ".ass"), "w", encoding="utf-8") as srt:
